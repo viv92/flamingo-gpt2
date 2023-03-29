@@ -1,1 +1,2 @@
-Google drive link to download the clip model checkpoint: https://drive.google.com/file/d/1tCczjUd_DC8pa-f-gIBK4-4zGdHi1SAc/view?usp=share_link
+Google drive link to download the clip model checkpoint: 
+https://drive.google.com/file/d/1tCczjUd_DC8pa-f-gIBK4-4zGdHi1SAc/view?usp=share_link
