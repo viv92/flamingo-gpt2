@@ -1,8 +1,8 @@
 ### This program impelements the entire flamingo model pipeline, but supports only gpt2 backbone and one image per prompt.
 
 ## Features:
-# 1. CLIP based pre-trained resnet is used as the frozen vision encoder.
-# 2. Output from the frozen resnet is fed to perceiver resampler to obtain a compressed latent vector for media inputs
+# 1. This implementation doesn't use a frozen image encoder (CLIP). The perceiver resampler operates directly on the image pixels as byte array.
+# 2. Flattened images are fed to perceiver resampler to obtain a compressed latent vector for media inputs
 # 3. The media latent vector and the corresponding prompt text are fed to the pretrained frozen LLM to autoregressively predict the prompt at output
 # 4. The frozen LLM is interspersed with trainable gated cross-attn layers that perform cross-attn between the media latents and the text tokens, with media specific masks and tanh gating controlled by learnable parameters
 
@@ -146,7 +146,7 @@ def append_gxd_blocks(model, gxd_block):
         model.transformer.h[i] = Modified_LMBlock(new_gxd_block, original_block)
     return model 
 
-# utility function for learning rate schedule - increase linearly from 0 to 1e-4 over first 5k steps as specified in the flamingo paper
+# utility function for learning rate schedule - increase linearly from lr_init to lr_max over first warmup_steps as specified in the flamingo paper
 def lr_rate(curr_step, warmup_steps, lr_init, lr_max):
     curr_step += 1 # one-indexed instead of zero indexed
     lr_new = min(lr_max, lr_init + curr_step * (lr_max - lr_init) / warmup_steps)
@@ -164,33 +164,33 @@ if __name__ == '__main__':
     max_seq_len_gpt2 = 1024 # required to init GPT2 Tokenizer
 
     # hyperparams for gated xattn dense (gxd) layer 
-    n_heads_gxd = 2 # 8 
+    n_heads_gxd = 4 # 8 
     d_k_gxd = d_model // n_heads_gxd 
     d_v_gxd = d_k_gxd
     d_ff_gxd = 2048
 
-    # hyperparams for CLIP (as required by the clip checkpoint)
-    img_size = 224 # resize for resnet
-    d_model_clip = 512
-    d_k_clip = 64
-    d_v_clip = 64
-    n_heads_clip = 8
-    n_layers_clip = 6
-    d_ff_clip = 2048
+    # # hyperparams for CLIP (as required by the clip checkpoint)
+    img_size = 64 # a convenient size for processing through perceiver resampler 
+    # d_model_clip = 512
+    # d_k_clip = 64
+    # d_v_clip = 64
+    # n_heads_clip = 8
+    # n_layers_clip = 6
+    # d_ff_clip = 2048
 
     # hyperparams for perceiver resampler 
     n_latents = 64 # 16
     n_layers_perceiver = 12 # 6
     d_ff_perceiver = 2048
-    media_seqlen = d_model_clip # since our clip image encoder flattens the output internally
-    media_dim = 1 # since our clip image encoder flattens the output internally
+    media_seqlen = img_size * img_size # since input byte array to perceiver is just the flattened img with seq_len = h*w 
+    media_dim = 3 # since input img channels = 3
 
     dropout = 0.1
     lr_init = 1e-5 # scheduled
     lr_max = 1e-3
-    batch_size = 8 # 16
-    accumulation_steps = 64 # 128
-    num_epochs = 10000 # 10000
+    batch_size = 2 # 16
+    accumulation_steps = 64 # 256
+    num_epochs = 5000 # 10000
     epochs_done = 0
     random_seed = 10
 
@@ -198,7 +198,7 @@ if __name__ == '__main__':
 
     gpt2_model_name = 'gpt2'
 
-    ckpt_path_clip = 'ckpts/clip_resnet.pt'
+    # ckpt_path_clip = 'ckpts/clip_resnet.pt'
 
     resume_training_from_ckpt = False 
 
@@ -214,26 +214,25 @@ if __name__ == '__main__':
     # device
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     # clip_device = torch.device('cpu') # clip model will be loaded for inference on the cpu (to save memory on the gpu for diffusion prior model)
-    clip_device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    # clip_device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
-    # dummy variables for clip text encoder (only for initialization, we don't use clip text encoder)
-    vocab_size_clip = 10000 # as required by the clip checkpoint
-    eos_token = -1
+    # # dummy variables for clip text encoder (only for initialization, we don't use clip text encoder)
+    # vocab_size_clip = 10000 # as required by the clip checkpoint
+    # eos_token = -1
 
     # load voc data and create img_cap_dict
     img_tag = '<image>'
     dataset, max_seq_len_clip = load_data(img_tag) # loads data and pre-pends img_tag to each caption
     dataset_len = len(dataset)
-    max_seq_len_clip = 53
 
-    # init clip model
-    clip_image_encoder = ImageEmbeddings(forward_hook, d_model_clip).to(clip_device) # resnet
-    clip_text_encoder = init_text_encoder(vocab_size_clip, max_seq_len_clip, d_model_clip, d_k_clip, d_v_clip, n_heads_clip, n_layers_clip, d_ff_clip, dropout, clip_device).to(clip_device) # not used - just for initialization and loading the pretrained clip model
-    clip_model = init_CLIP(clip_text_encoder, clip_image_encoder, d_model_clip, eos_token).to(clip_device)
-    # load clip_model weights and put clip_model in eval mode
-    clip_model = load_ckpt(ckpt_path_clip, clip_model, device=clip_device, mode='eval') # TODO: check if this is a good checkpoint (refer the clip pretraining)
-    # freeze clip model 
-    clip_model = freeze(clip_model)
+    # # init clip model
+    # clip_image_encoder = ImageEmbeddings(forward_hook, d_model_clip).to(clip_device) # resnet
+    # clip_text_encoder = init_text_encoder(vocab_size_clip, max_seq_len_clip, d_model_clip, d_k_clip, d_v_clip, n_heads_clip, n_layers_clip, d_ff_clip, dropout, clip_device).to(clip_device) # not used - just for initialization and loading the pretrained clip model
+    # clip_model = init_CLIP(clip_text_encoder, clip_image_encoder, d_model_clip, eos_token).to(clip_device)
+    # # load clip_model weights and put clip_model in eval mode
+    # clip_model = load_ckpt(ckpt_path_clip, clip_model, device=clip_device, mode='eval') # TODO: check if this is a good checkpoint (refer the clip pretraining)
+    # # freeze clip model 
+    # clip_model = freeze(clip_model)
 
     # init perceiver resampler 
     perceiver_resampler = init_perceiver_resampler(n_latents, media_seqlen, media_dim, d_model, n_layers_perceiver, d_ff_perceiver, dropout, device).to(device)
@@ -260,7 +259,7 @@ if __name__ == '__main__':
 
     # optimizer and scheduler
     optimizer = torch.optim.AdamW(params=params, lr=lr_init)
-    lr_scheduler = LambdaLR(optimizer, lr_lambda=lambda x: lr_rate(x, warmup_steps, lr_init, lr_max) ) # x increases like a counter on each call to lr_scheduler.step()
+    scheduler = LambdaLR(optimizer, lr_lambda=lambda x: lr_rate(x, warmup_steps, lr_init, lr_max) ) # x increases like a counter on each call to lr_scheduler.step()
 
     # loss function 
     loss_fn = nn.CrossEntropyLoss(reduction='none')
@@ -282,7 +281,7 @@ if __name__ == '__main__':
         minibatch = [dataset[i] for i in idx]
 
         # process minibatch - convert img_filenames to augmented_imgs and convert caption_text to tokenized_captions
-        imgs, cap_tokens_dict = process_batch(minibatch, gpt2_tokenizer, img_size, device) # imgs.shape:[b, 3, 224, 224], captions.shape:[b, batch_seq_len]
+        imgs, cap_tokens_dict = process_batch(minibatch, gpt2_tokenizer, img_size, device) # imgs.shape:[b, 3, img_size, img_size], captions.shape:[b, batch_seq_len]
         cap_tokens, cap_attn_mask = cap_tokens_dict.input_ids, cap_tokens_dict.attention_mask
 
         # append begginning of sentence <bos> token to cap_tokens
@@ -294,13 +293,13 @@ if __name__ == '__main__':
         cap_attn_mask_rshifted = torch.cat((cap_attn_mask[:, 0].unsqueeze(1), cap_attn_mask), dim=-1)
         cap_attn_mask_rshifted = cap_attn_mask_rshifted[:, :-1]
 
-        # pass image through frozen clip image encoder 
-        clip_img_emb = clip_model.image_encoder(imgs) # clip_img_emb.shape: [b, d_model]
+        # flatten imgs to pass to perceiver resampler 
+        imgs_flat = imgs.flatten(start_dim=-2, end_dim=-1) # imgs_flat.shape: [b, 3, img_size * img_size]
+        imgs_flat = imgs_flat.permute(0,2,1) # imgs_flat.shape: [b, img_size * img_size, 3]
 
-        # pass img_emb through perceiver resampler 
-        # for perceiver, the img_emb is treated as a byte array with seqlen = d_model and num_channels = 1
-        clip_img_emb = clip_img_emb.unsqueeze(-1) # clip_img_emb.shape: [b, d_model, 1]
-        img_latent = perceiver_resampler(clip_img_emb) # img_latent.shape: [b, n_latents, d_model]
+        # pass imgs_flat through perceiver resampler 
+        # for perceiver, the imgs_flat is treated as a byte array with seqlen = img_size * img_size and num_channels = 3
+        img_latent = perceiver_resampler(imgs_flat) # img_latent.shape: [b, n_latents, d_model]
         # # average out latents to have one latent per image 
         # img_latent = img_latent.mean(dim=-2) # img_latent.shape: [b, d_model] # TODO: Isn't this operation losing a lot of information? Moreover, this will yield just single key and value for xattn in the gxd blocks (so query will have no influence on attn output)
         # img_latent = img_latent.unsqueeze(-2) # img_latent.shape[b, 1, d_model]
@@ -319,17 +318,17 @@ if __name__ == '__main__':
                 ff_gates[i].append(torch.tanh(alpha_ff).abs().item())
         
         # forward prop the caption (query) through the 'flamingo-ed' LLM
-        # TODO: gpt2_model creates a causal mask internally if none passed, but check how does it create a padding_mask
+        # TODO: gpt2_model creates a causal mask internally if none passed, but check how does it create a padding_mask [ANS: the padding mask is created by the tokenizer]
         out = gpt2_model(input_ids=cap_tokens_rshifted, attention_mask=cap_attn_mask_rshifted)
 
         # loss
         targets = cap_tokens
         scores = out.logits
         scores = scores.permute(0, 2, 1) # scores.shape: [b, vocab_size, batch_seq_len] - required for crossEntropyLoss
-        loss = loss_fn(scores, targets)
+        loss = loss_fn(scores, targets) 
         # # TODO: zero out loss corresponding to pad tokens in the targets [Ans: this is wrong as zeroing out loss corresponding to pad tokens leads to garbage predictions after EOS]
         # loss = loss * cap_attn_mask
-        loss = loss.mean()
+        loss = loss.mean() 
         # adjusting for gradient accumulation
         loss_scaled = loss / accumulation_steps 
 
@@ -339,8 +338,9 @@ if __name__ == '__main__':
         # optimization step (with gradient accumulation)
         if (ep+1) % accumulation_steps == 0:
             optimizer.step()
-            lr_scheduler.step()
+            scheduler.step()
             optimizer.zero_grad()
+
 
         # calculate batch accuracy 
         pred_cap_tokens = torch.argmax(scores, dim=1) # shape: [batch_size, seq_len]
@@ -370,9 +370,10 @@ if __name__ == '__main__':
     hyperparam_dict['n_layers_perceiver'] = n_layers_perceiver
     hyperparam_dict['lr_init'] = lr_init 
     hyperparam_dict['lr_max'] = lr_max 
-    hyperparam_dict['warmup_steps'] = warmup_steps   
+    hyperparam_dict['warmup'] = warmup_steps  
     hyperparam_dict['batchsz'] = batch_size 
-    hyperparam_dict['accumulation_steps'] = accumulation_steps 
+    hyperparam_dict['img_sz'] = img_size 
+    hyperparam_dict['accum_steps'] = accumulation_steps 
     hyperparam_dict['n_epochs'] = num_epochs
     hyperparam_dict['seed'] = random_seed 
     
@@ -403,6 +404,6 @@ if __name__ == '__main__':
     ax[2,0].set(xlabel='train_iters')
 
     plt.suptitle('flamingo one image - training curves')
-    plt.savefig('plots/flamingo_oneimage_unMeanImgLatents_fixedPadMask_trainData' + hyperstr +  '.png')
+    plt.savefig('plots/flamingo_oneimage_unMeanImgLatents_noClip_fixedPadMask_trainData' + hyperstr +  '.png')
 
 
